@@ -2,7 +2,8 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const ytdl = require('ytdl-core');
+// Use @distube/ytdl-core instead of ytdl-core
+const ytdl = require('@distube/ytdl-core'); 
 
 // Initialize express
 const app = express();
@@ -11,16 +12,23 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Common request options to bypass YouTube restrictions
+const requestOptions = {
+  headers: {
+    'Cookie': 'CONSENT=YES+1',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Referer': 'https://www.youtube.com/',
+    'Accept-Language': 'en-US,en;q=0.9',
+  }
+};
+
 // Function to search YouTube using scraping technique
 const searchYouTube = async (query) => {
   try {
     const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
 
     const response = await axios.get(searchUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-      }
+      headers: requestOptions.headers
     });
 
     // Extract initial data from the page
@@ -59,11 +67,8 @@ const searchYouTube = async (query) => {
           videoUrl: `https://www.youtube.com/watch?v=${videoData.videoId}`,
           videoId: videoData.videoId,
           // Offer both download options
-          downloadMp4: `/api/download?videoId=${videoData.videoId}&format=mp4`,
-          downloadMp3: `/api/download?videoId=${videoData.videoId}&format=mp3`,
-          // Direct download options
-          directMp4: `/api/direct-download?videoId=${videoData.videoId}&format=mp4`,
-          directMp3: `/api/direct-download?videoId=${videoData.videoId}&format=mp3`
+          downloadMp4: `/api/direct-download?videoId=${videoData.videoId}&format=mp4`,
+          downloadMp3: `/api/direct-download?videoId=${videoData.videoId}&format=mp3`
         };
       });
 
@@ -97,17 +102,33 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// Improved download endpoint with format selection
+// Download endpoint - now tries multiple approaches
 app.get('/api/download', async (req, res) => {
   const videoId = req.query.videoId;
-  const format = req.query.format || 'mp4'; // Allow format selection (mp4/mp3)
+  const format = req.query.format || 'mp4';
 
   if (!videoId) {
     return res.status(400).json({ error: 'Video ID is required' });
   }
 
   try {
-    const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`);
+    // Try with embed URL first
+    const embedUrl = `https://www.youtube.com/embed/${videoId}`;
+    console.log(`Trying to get info from embed URL: ${embedUrl}`);
+
+    let info;
+    try {
+      info = await ytdl.getInfo(embedUrl, {
+        requestOptions: requestOptions
+      });
+    } catch (embedError) {
+      console.log(`Embed URL failed, trying watch URL: ${embedError.message}`);
+      // If embed fails, try with watch URL
+      const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+      info = await ytdl.getInfo(watchUrl, {
+        requestOptions: requestOptions
+      });
+    }
 
     let formatUrl;
 
@@ -126,26 +147,34 @@ app.get('/api/download', async (req, res) => {
       const videoFormats = ytdl.filterFormats(info.formats, 'videoandaudio');
 
       if (videoFormats.length === 0) {
-        return res.status(404).json({ error: 'No combined video/audio format found' });
+        // Fallback to separate video and audio
+        console.log('No combined formats found, falling back to video-only formats');
+        const videoOnlyFormats = ytdl.filterFormats(info.formats, 'videoonly');
+        if (videoOnlyFormats.length === 0) {
+          return res.status(404).json({ error: 'No video format found' });
+        }
+        const bestVideo = videoOnlyFormats.sort((a, b) => {
+          const resA = a.qualityLabel ? parseInt(a.qualityLabel.match(/(\d+)p/)[1], 10) : 0;
+          const resB = b.qualityLabel ? parseInt(b.qualityLabel.match(/(\d+)p/)[1], 10) : 0;
+          return resB - resA;
+        })[0];
+        formatUrl = bestVideo.url;
+      } else {
+        // Use highest quality combined format
+        const bestVideo = videoFormats[0]; // They're usually already sorted
+        formatUrl = bestVideo.url;
       }
-
-      // Sort by quality - convert quality label to numeric value for proper sorting
-      const getBitrateValue = (format) => {
-        if (!format.qualityLabel) return 0;
-        const match = format.qualityLabel.match(/(\d+)p/);
-        return match ? parseInt(match[1], 10) : 0;
-      };
-
-      const bestVideo = videoFormats.sort((a, b) => getBitrateValue(b) - getBitrateValue(a))[0];
-      formatUrl = bestVideo.url;
     }
 
     if (!formatUrl) {
       return res.status(404).json({ error: 'No suitable URL found' });
     }
 
+    // Add timestamp to avoid caching
+    formatUrl = formatUrl + (formatUrl.includes('?') ? '&' : '?') + '_t=' + Date.now();
+
     // Redirect to the media URL
-    console.log(`Redirecting to: ${formatUrl.substring(0, 100)}...`); // Log for debugging
+    console.log(`Redirecting to: ${formatUrl.substring(0, 100)}...`);
     res.redirect(formatUrl);
 
   } catch (error) {
@@ -167,8 +196,25 @@ app.get('/api/direct-download', async (req, res) => {
   }
 
   try {
-    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-    const info = await ytdl.getInfo(videoUrl);
+    // Try different URL formats to increase chances of success
+    let videoUrl;
+    let info;
+
+    try {
+      videoUrl = `https://www.youtube.com/embed/${videoId}`;
+      console.log(`Trying embed URL: ${videoUrl}`);
+      info = await ytdl.getInfo(videoUrl, { requestOptions });
+    } catch (embedError) {
+      try {
+        videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        console.log(`Trying watch URL: ${videoUrl}`);
+        info = await ytdl.getInfo(videoUrl, { requestOptions });
+      } catch (watchError) {
+        videoUrl = `https://youtu.be/${videoId}`;
+        console.log(`Trying short URL: ${videoUrl}`);
+        info = await ytdl.getInfo(videoUrl, { requestOptions });
+      }
+    }
 
     // Set filename from video title
     const sanitizedTitle = info.videoDetails.title.replace(/[^\w\s]/gi, '').replace(/\s+/g, '_');
@@ -178,26 +224,95 @@ app.get('/api/direct-download', async (req, res) => {
       res.setHeader('Content-Disposition', `attachment; filename="${sanitizedTitle}.mp3"`);
       res.setHeader('Content-Type', 'audio/mpeg');
 
-      // Stream audio only
+      // Stream audio only with all options
       ytdl(videoUrl, {
+        requestOptions,
         quality: 'highestaudio',
         filter: 'audioonly',
+        highWaterMark: 1 << 25, // 32MB buffer
       }).pipe(res);
     } else {
       // Set proper headers for video download
       res.setHeader('Content-Disposition', `attachment; filename="${sanitizedTitle}.mp4"`);
       res.setHeader('Content-Type', 'video/mp4');
 
-      // Stream video with audio
+      // Stream video with audio and all options
       ytdl(videoUrl, {
+        requestOptions,
         quality: 'highest',
-        filter: 'audioandvideo',
+        filter: format === 'mp4' ? 'videoandaudio' : 'videoonly',
+        highWaterMark: 1 << 25, // 32MB buffer
       }).pipe(res);
     }
   } catch (error) {
     console.error('Error streaming video/audio:', error);
     res.status(500).json({ 
       error: 'Failed to stream media',
+      message: error.message,
+      stack: error.stack // Include stack for debugging
+    });
+  }
+});
+
+// Add a proxy endpoint as another alternative
+app.get('/api/proxy-download', async (req, res) => {
+  const videoId = req.query.videoId;
+  const format = req.query.format || 'mp4';
+
+  if (!videoId) {
+    return res.status(400).json({ error: 'Video ID is required' });
+  }
+
+  try {
+    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const info = await ytdl.getInfo(videoUrl, { requestOptions });
+
+    let mediaUrl;
+
+    if (format === 'mp3') {
+      const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
+      mediaUrl = audioFormats[0].url;
+    } else {
+      const videoFormats = ytdl.filterFormats(info.formats, 'videoandaudio');
+      if (videoFormats.length > 0) {
+        mediaUrl = videoFormats[0].url;
+      } else {
+        const videoOnlyFormats = ytdl.filterFormats(info.formats, 'videoonly');
+        mediaUrl = videoOnlyFormats[0].url;
+      }
+    }
+
+    if (!mediaUrl) {
+      return res.status(404).json({ error: 'No suitable URL found' });
+    }
+
+    // Use axios to proxy the request
+    const mediaResponse = await axios({
+      method: 'get',
+      url: mediaUrl,
+      responseType: 'stream',
+      headers: {
+        ...requestOptions.headers,
+        'Referer': 'https://www.youtube.com/'
+      }
+    });
+
+    // Forward content headers
+    Object.keys(mediaResponse.headers).forEach(header => {
+      res.setHeader(header, mediaResponse.headers[header]);
+    });
+
+    // Set filename
+    const sanitizedTitle = info.videoDetails.title.replace(/[^\w\s]/gi, '').replace(/\s+/g, '_');
+    res.setHeader('Content-Disposition', `attachment; filename="${sanitizedTitle}.${format}"`);
+
+    // Pipe the response
+    mediaResponse.data.pipe(res);
+
+  } catch (error) {
+    console.error('Error in proxy download:', error);
+    res.status(500).json({ 
+      error: 'Failed to proxy media',
       message: error.message
     });
   }
@@ -215,6 +330,7 @@ app.get('/', (req, res) => {
           code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
           pre { background: #f4f4f4; padding: 15px; border-radius: 5px; overflow-x: auto; }
           .endpoint { margin-bottom: 20px; }
+          .note { color: #666; font-style: italic; }
         </style>
       </head>
       <body>
@@ -243,6 +359,15 @@ app.get('/', (req, res) => {
           <p>Stream and download the file directly with proper filename</p>
         </div>
 
+        <div class="endpoint">
+          <h3>Proxy Download (Alternative Method)</h3>
+          <code>GET /api/proxy-download?videoId=VIDEO_ID&format=mp4</code> or 
+          <code>GET /api/proxy-download?videoId=VIDEO_ID&format=mp3</code>
+          <p>Download via server-side proxy (try this if other methods fail)</p>
+        </div>
+
+        <p class="note">Note: If one download method fails, try another. YouTube occasionally changes their systems which can affect downloads.</p>
+
         <h2>Example Response:</h2>
         <pre>{
   "query": "example search",
@@ -256,10 +381,8 @@ app.get('/', (req, res) => {
       "published": "2 years ago",
       "videoUrl": "https://www.youtube.com/watch?v=VIDEO_ID",
       "videoId": "VIDEO_ID",
-      "downloadMp4": "/api/download?videoId=VIDEO_ID&format=mp4",
-      "downloadMp3": "/api/download?videoId=VIDEO_ID&format=mp3",
-      "directMp4": "/api/direct-download?videoId=VIDEO_ID&format=mp4",
-      "directMp3": "/api/direct-download?videoId=VIDEO_ID&format=mp3"
+      "downloadMp4": "/api/direct-download?videoId=VIDEO_ID&format=mp4",
+      "downloadMp3": "/api/direct-download?videoId=VIDEO_ID&format=mp3"
     }
   ]
 }</pre>
